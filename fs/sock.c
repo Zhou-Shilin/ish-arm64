@@ -891,7 +891,12 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     if (user_read(value_addr, value, value_len))
         return _EFAULT;
 
-    if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
+    if (level == SOL_SOCKET_ && option == SO_PASSCRED_) {
+        dword_t *enabled = (dword_t *) value;
+        if (value_len != sizeof(*enabled))
+            return _EINVAL;
+        *enabled = 1;
+    } else if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
         dword_t *value_p = (dword_t *) value;
         if (value_len != sizeof(*value_p))
             return _EINVAL;
@@ -1087,10 +1092,10 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
 
     struct scm *scm = NULL;
     char real_msg_control[CMSG_SPACE(sizeof(int))]; // only used if actually sending an fd
+    unsigned num_fds = 0;
     if (sock->socket.domain == AF_LOCAL_ && msg_control != NULL && msg_fake.msg_controllen >= sizeof(struct cmsghdr_)) {
         // figure out how many file descriptors we're sending
         uint8_t *mhdr_end = msg_control + msg_fake.msg_controllen;
-        unsigned num_fds = 0;
         struct cmsghdr_ *cmsg;
         for (cmsg = (void *) msg_control; cmsg != NULL; cmsg = CMSG_NXTHDR_(cmsg, mhdr_end)) {
             if (cmsg->level != SOL_SOCKET_)
@@ -1101,9 +1106,34 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         }
         if (num_fds > 253) // *magic*
             return _EINVAL;
+    }
+
+    if (sock->socket.domain == AF_LOCAL_) {
+        scm = malloc(sizeof(struct scm) + num_fds * sizeof(struct fd *));
+        if (scm == NULL) {
+            err = _ENOMEM;
+            goto out_free_iov;
+        }
+        list_init(&scm->queue);
+        fill_cred(&scm->cred);
+        scm->num_fds = num_fds;
 
         if (num_fds > 0) {
-            // send one (1) real fd and put the rest in a struct scm
+            unsigned fd_i = 0;
+            uint8_t *mhdr_end = msg_control + msg_fake.msg_controllen;
+            struct cmsghdr_ *cmsg;
+            for (cmsg = (void *) msg_control; cmsg != NULL; cmsg = CMSG_NXTHDR_(cmsg, mhdr_end)) {
+                if (cmsg->level != SOL_SOCKET_)
+                    continue;
+                fd_t *fds = (void *) cmsg->data;
+                for (unsigned i = 0; i < (cmsg->len - sizeof(struct cmsghdr_)) / sizeof(fd_t); i++) {
+                    STRACE(" sending fd %d", fds[i]);
+                    scm->fds[fd_i++] = fd_retain(f_get(fds[i]));
+                }
+            }
+
+            // The host ancillary message is only a wakeup/token; the guest
+            // descriptors themselves stay in scm until the peer receives it.
             static int real_fd = -1;
             if (real_fd == -1) {
                 real_fd = open(".", O_RDONLY);
@@ -1117,32 +1147,19 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
             real_cmsg->cmsg_type = SCM_RIGHTS;
             real_cmsg->cmsg_len = CMSG_LEN(sizeof(real_fd));
             memcpy(CMSG_DATA(real_cmsg), &real_fd, sizeof(real_fd));
-
-            scm = malloc(sizeof(struct scm) + num_fds * sizeof(struct fd *));
-            list_init(&scm->queue);
-            scm->num_fds = num_fds;
-            unsigned fd_i = 0;
-            for (cmsg = (void *) msg_control; cmsg != NULL; cmsg = CMSG_NXTHDR_(cmsg, mhdr_end)) {
-                if (cmsg->level != SOL_SOCKET_)
-                    continue;
-                fd_t *fds = (void *) cmsg->data;
-                for (unsigned i = 0; i < (cmsg->len - sizeof(struct cmsghdr_)) / sizeof(fd_t); i++) {
-                    STRACE(" sending fd %d", fds[i]);
-                    scm->fds[fd_i++] = fd_retain(f_get(fds[i]));
-                }
-            }
-            lock(&peer_lock);
-            struct fd *peer = sock->socket.unix_peer;
-            if (peer == NULL) {
-                unlock(&peer_lock);
-                err = _EPIPE;
-                goto out_free_scm;
-            }
-            lock(&peer->lock);
-            list_add_tail(&peer->socket.unix_scm, &scm->queue);
-            unlock(&peer->lock);
-            unlock(&peer_lock);
         }
+
+        lock(&peer_lock);
+        struct fd *peer = sock->socket.unix_peer;
+        if (peer == NULL) {
+            unlock(&peer_lock);
+            err = _EPIPE;
+            goto out_free_scm;
+        }
+        lock(&peer->lock);
+        list_add_tail(&peer->socket.unix_scm, &scm->queue);
+        unlock(&peer->lock);
+        unlock(&peer_lock);
     }
 
     msg.msg_flags = sock_flags_to_real(msg_fake.msg_flags);
@@ -1201,6 +1218,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     if (user_get(msghdr_addr, msg_fake))
         return _EFAULT;
 #endif
+    const size_t guest_control_capacity = msg_fake.msg_controllen;
 
     struct msghdr msg;
 
@@ -1319,38 +1337,64 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         free(msg_iov[i].iov_base);
     }
 
-    // msg_control (changed)
+    // msg_control (changed). Darwin has no SO_PASSCRED/SCM_CREDENTIALS, so
+    // Unix ancillary data is queued inside iSH alongside the host message.
     msg_fake.msg_controllen = 0;
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (sock->socket.domain == AF_LOCAL_ && cmsg != NULL &&
-            cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-        int dummy_fd = ((int *) CMSG_DATA(cmsg))[0];
+    struct cmsghdr *host_cmsg = CMSG_FIRSTHDR(&msg);
+    if (host_cmsg != NULL && host_cmsg->cmsg_level == SOL_SOCKET &&
+            host_cmsg->cmsg_type == SCM_RIGHTS) {
+        int dummy_fd = ((int *) CMSG_DATA(host_cmsg))[0];
         close(dummy_fd);
+    }
 
+    struct scm *scm = NULL;
+    if (res >= 0 && sock->socket.domain == AF_LOCAL_) {
         lock(&sock->lock);
-        assert(!list_empty(&sock->socket.unix_scm));
-        struct scm *scm = list_first_entry(&sock->socket.unix_scm, struct scm, queue);
-        list_remove(&scm->queue);
+        if (!list_empty(&sock->socket.unix_scm)) {
+            scm = list_first_entry(&sock->socket.unix_scm, struct scm, queue);
+            list_remove(&scm->queue);
+        }
         unlock(&sock->lock);
+    }
 
-        if (res < 0) {
+    if (scm != NULL) {
+        uint8_t guest_control[2048] = {};
+        const size_t align = CMSG_ALIGN_;
+        const size_t cred_len = sizeof(struct cmsghdr_) + sizeof(struct ucred_);
+        const size_t cred_space = (cred_len + align - 1) & ~(align - 1);
+        const size_t rights_len = sizeof(struct cmsghdr_) + scm->num_fds * sizeof(fd_t);
+        const size_t rights_space = (rights_len + align - 1) & ~(align - 1);
+        const size_t required = cred_space + (scm->num_fds > 0 ? rights_space : 0);
+
+        if (msg_fake.msg_control == 0 || guest_control_capacity < required) {
+            msg_fake.msg_flags |= MSG_CTRUNC_;
             scm_free(scm);
-            return err;
-        }
+        } else {
+            struct cmsghdr_ *cred_cmsg = (void *)guest_control;
+            cred_cmsg->len = cred_len;
+            cred_cmsg->level = SOL_SOCKET_;
+            cred_cmsg->type = SCM_CREDENTIALS_;
+            memcpy(cred_cmsg->data, &scm->cred, sizeof(scm->cred));
 
-        uint8_t msg_control[sizeof(struct cmsghdr_) + scm->num_fds * sizeof(fd_t)];
-        struct cmsghdr_ *cmsg = (void *) msg_control;
-        cmsg->len = sizeof(msg_control);
-        cmsg->level = SOL_SOCKET_;
-        cmsg->type = SCM_RIGHTS_;
-        fd_t *fds = (void *) cmsg->data;
-        for (unsigned i = 0; i < scm->num_fds; i++) {
-            fds[i] = f_install(scm->fds[i], 0);
-            STRACE(" receiving fd %d", fds[i]);
+            if (scm->num_fds > 0) {
+                struct cmsghdr_ *rights_cmsg = (void *)(guest_control + cred_space);
+                rights_cmsg->len = rights_len;
+                rights_cmsg->level = SOL_SOCKET_;
+                rights_cmsg->type = SCM_RIGHTS_;
+                fd_t *fds = (void *)rights_cmsg->data;
+                for (unsigned i = 0; i < scm->num_fds; i++) {
+                    fds[i] = f_install(scm->fds[i], 0);
+                    STRACE(" receiving fd %d", fds[i]);
+                }
+            }
+
+            if (user_write(msg_fake.msg_control, guest_control, required)) {
+                free(scm);
+                return _EFAULT;
+            }
+            msg_fake.msg_controllen = required;
+            free(scm);
         }
-        if (user_write(msg_fake.msg_control, cmsg, cmsg->len))
-            return _EFAULT;
-        msg_fake.msg_controllen = msg.msg_controllen;
     }
 
     // by now the iovecs and scm have been freed so we can return

@@ -144,7 +144,7 @@ static int fdtable_expand(struct fdtable *table, fd_t max) {
 }
 
 struct fd *fdtable_get(struct fdtable *table, fd_t f) {
-    if (f < 0 || (unsigned) f >= current->files->size)
+    if (f < 0 || (unsigned) f >= table->size)
         return NULL;
     return table->files[f];
 }
@@ -244,32 +244,65 @@ void fdtable_do_cloexec(struct fdtable *table) {
 
 dword_t sys_dup(fd_t f) {
     STRACE("dup(%d)", f);
-    struct fd *fd = f_get(f);
-    if (fd == NULL)
+    struct fdtable *table = current->files;
+    lock(&table->lock);
+    struct fd *fd = fdtable_get(table, f);
+    if (fd == NULL) {
+        unlock(&table->lock);
         return _EBADF;
-    fd->refcount++;
-    return f_install(fd, 0);
+    }
+    fd_retain(fd);
+    fd_t new_f = f_install_start(fd, 0);
+    unlock(&table->lock);
+    return new_f;
+}
+
+static dword_t duplicate_to(fd_t f, fd_t new_f, int_t flags, bool reject_same_fd) {
+    if (new_f < 0 || flags & ~O_CLOEXEC_)
+        return _EINVAL;
+
+    struct fdtable *table = current->files;
+    lock(&table->lock);
+    struct fd *fd = fdtable_get(table, f);
+    if (fd == NULL) {
+        unlock(&table->lock);
+        return _EBADF;
+
+    }
+    if (f == new_f) {
+        unlock(&table->lock);
+        return reject_same_fd ? _EINVAL : new_f;
+    }
+
+    int err = fdtable_expand(table, new_f);
+    if (err < 0) {
+        unlock(&table->lock);
+        return err;
+    }
+
+    // dup2/dup3 atomically replace the target descriptor. Retain the source
+    // first because both descriptor numbers may refer to the same open file
+    // description.
+    fd_retain(fd);
+    if (table->files[new_f] != NULL)
+        fdtable_close(table, new_f);
+    table->files[new_f] = fd;
+    if (flags & O_CLOEXEC_)
+        bit_set(new_f, table->cloexec);
+    else
+        bit_clear(new_f, table->cloexec);
+    unlock(&table->lock);
+    return new_f;
 }
 
 dword_t sys_dup3(fd_t f, fd_t new_f, int_t flags) {
     STRACE("dup3(%d, %d, %d)", f, new_f, flags);
-    struct fdtable *table = current->files;
-    struct fd *fd = f_get(f);
-    if (fd == NULL)
-        return _EBADF;
-    int err = fdtable_expand(table, new_f);
-    if (err < 0)
-        return err;
-    fd_retain(fd);
-    f_close(new_f);
-    table->files[new_f] = fd;
-    if (flags & O_CLOEXEC_)
-        bit_set(new_f, table->cloexec);
-    return new_f;
+    return duplicate_to(f, new_f, flags, true);
 }
 
 dword_t sys_dup2(fd_t f, fd_t new_f) {
-    return sys_dup3(f, new_f, 0);
+    STRACE("dup2(%d, %d)", f, new_f);
+    return duplicate_to(f, new_f, 0, false);
 }
 
 int fd_getflags(struct fd *fd) {
@@ -298,14 +331,36 @@ dword_t sys_fcntl(fd_t f, dword_t cmd, addr_t arg) {
     switch (cmd) {
         case F_DUPFD_:
             STRACE("fcntl(%d, F_DUPFD, %d)", f, arg);
-            fd->refcount++;
-            return f_install_start(fd, arg);
+            new_f = (fd_t) arg;
+            if (new_f < 0)
+                return _EINVAL;
+            lock(&table->lock);
+            fd = fdtable_get(table, f);
+            if (fd == NULL) {
+                unlock(&table->lock);
+                return _EBADF;
+            }
+            fd_retain(fd);
+            new_f = f_install_start(fd, new_f);
+            unlock(&table->lock);
+            return new_f;
 
         case F_DUPFD_CLOEXEC_:
             STRACE("fcntl(%d, F_DUPFD_CLOEXEC, %d)", f, arg);
-            fd->refcount++;
-            new_f = f_install_start(fd, arg);
-            bit_set(new_f, table->cloexec);
+            new_f = (fd_t) arg;
+            if (new_f < 0)
+                return _EINVAL;
+            lock(&table->lock);
+            fd = fdtable_get(table, f);
+            if (fd == NULL) {
+                unlock(&table->lock);
+                return _EBADF;
+            }
+            fd_retain(fd);
+            new_f = f_install_start(fd, new_f);
+            if (new_f >= 0)
+                bit_set(new_f, table->cloexec);
+            unlock(&table->lock);
             return new_f;
 
         case F_GETFD_:
@@ -392,31 +447,45 @@ dword_t sys_fcntl32(fd_t fd, dword_t cmd, addr_t arg) {
     return sys_fcntl(fd, cmd, arg);
 }
 
-// close_range(unsigned first, unsigned last, unsigned flags) — Linux 5.9+ syscall #436.
-// Closes all open fds in [first, last]. Used by Anthropic claude-cli, openssh,
-// systemd, etc.; without this, claude-cli loops on missing-syscall ENOSYS.
-// CLOSE_RANGE_UNSHARE (0x02) and CLOSE_RANGE_CLOEXEC (0x04) are defined in
-// kernel headers but we treat them as no-ops here — guests that need the
-// CLOEXEC variant will fall back to F_SETFD anyway.
+// close_range(unsigned first, unsigned last, unsigned flags) - Linux 5.9+ syscall #436.
+// Closes all open fds in [first, last]. Used by Chromium, openssh, systemd,
+// and other programs that spawn subprocesses from multithreaded processes.
+#define CLOSE_RANGE_UNSHARE_ 0x02
 #define CLOSE_RANGE_CLOEXEC_ 0x04
 dword_t sys_close_range(uint32_t first, uint32_t last, uint32_t flags) {
     STRACE("close_range(%u, %u, 0x%x)", first, last, flags);
-    if (first > last)
+    if (first > last || flags & ~(CLOSE_RANGE_UNSHARE_ | CLOSE_RANGE_CLOEXEC_))
         return _EINVAL;
-    lock(&current->files->lock);
-    fd_t lim = current->files->size;
-    if ((fd_t)last >= lim) last = lim - 1;
+
+    if (flags & CLOSE_RANGE_UNSHARE_) {
+        struct fdtable *old_table = current->files;
+        struct fdtable *new_table = fdtable_copy(old_table);
+        if (IS_ERR(new_table))
+            return PTR_ERR(new_table);
+        current->files = new_table;
+        fdtable_release(old_table);
+    }
+
+    struct fdtable *table = current->files;
+    lock(&table->lock);
+    unsigned limit = table->size;
+    if (first >= limit) {
+        unlock(&table->lock);
+        return 0;
+    }
+    unsigned end = last < limit ? last : limit - 1;
     int err = 0;
-    for (fd_t f = (fd_t)first; f <= (fd_t)last; f++) {
-        if (current->files->files[f] == NULL) continue;
+    for (unsigned f = first; f <= end; f++) {
+        if (table->files[f] == NULL)
+            continue;
         if (flags & CLOSE_RANGE_CLOEXEC_) {
-            // Mark CLOEXEC instead of actually closing.
-            bit_set(f, current->files->cloexec);
+            bit_set(f, table->cloexec);
             continue;
         }
-        int e = fdtable_close(current->files, f);
-        if (e != 0 && err == 0) err = e;
+        int e = fdtable_close(table, (fd_t)f);
+        if (e != 0 && err == 0)
+            err = e;
     }
-    unlock(&current->files->lock);
-    return 0;  // Linux always returns 0 on success even if some close failed
+    unlock(&table->lock);
+    return err;
 }

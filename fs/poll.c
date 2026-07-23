@@ -606,4 +606,3 @@ static int rpe_events(struct real_poll_event *rpe) {
 static void real_poll_close(struct real_poll *real) {
     safe_close(real->fd);
 }
-

@@ -275,7 +275,7 @@ extern void gadget_dup_elem_vec(void);     // DUP Vd.<T>, Vn.<Ts>[idx] (element 
 extern void gadget_dup_elem_scalar(void);  // DUP <V>d, Vn.<T>[idx] (element to scalar)
 extern void gadget_ins_elem_vec(void);     // INS Vd.<T>[idx1], Vn.<T>[idx2] (element to element)
 extern void gadget_mov_v_to_gpr(void);     // MOV Xd, Vn.D[0]
-extern void gadget_umov_vec_to_gpr(void);  // UMOV/MOV Wd, Vn.<T>[idx]
+extern void gadget_umov_vec_to_gpr(void);  // UMOV/SMOV/MOV Rd, Vn.<T>[idx]
 extern void gadget_ins_gpr_to_vec_s(void); // MOV Vd.S[idx], Wn (INS from GPR)
 extern void gadget_ins_gpr_to_vec_d(void); // MOV Vd.D[idx], Xn (INS from GPR)
 extern void gadget_ins_gpr_to_vec_b(void); // MOV Vd.B[idx], Wn (INS from GPR, byte)
@@ -544,8 +544,12 @@ extern void gadget_scvtf_int_vec(void);    // SCVTF Vd.xS/Vd.2D, Vn.xS/Vn.2D (si
 extern void gadget_ucvtf_int_vec(void);    // UCVTF Vd.xS/Vd.2D, Vn.xS/Vn.2D (unsigned int to FP)
 extern void gadget_fcvtzs_int_vec(void);   // FCVTZS Vd.xS/Vd.2D, Vn.xS/Vn.2D (FP to signed int, toward zero)
 extern void gadget_fcvtzu_int_vec(void);   // FCVTZU Vd.xS/Vd.2D, Vn.xS/Vn.2D (FP to unsigned int, toward zero)
+extern void gadget_fcvtzs_fixpt_vec(void); // FCVTZS Vd.xS/Vd.2D, Vn.xS/Vn.2D, #fbits
+extern void gadget_fcvtzu_fixpt_vec(void); // FCVTZU Vd.xS/Vd.2D, Vn.xS/Vn.2D, #fbits
 extern void gadget_fcvtns_int_vec(void);   // FCVTNS (nearest, ties to even)
 extern void gadget_fcvtnu_int_vec(void);   // FCVTNU (nearest, unsigned)
+extern void gadget_fcvtl_vec(void);        // FCVTL/FCVTL2 (single to double precision)
+extern void gadget_fcvtn_vec(void);        // FCVTN/FCVTN2 (double to single precision)
 extern void gadget_fcvtms_int_vec(void);   // FCVTMS (toward -inf, signed)
 extern void gadget_fcvtmu_int_vec(void);   // FCVTMU (toward -inf, unsigned)
 extern void gadget_fcvtps_int_vec(void);   // FCVTPS (toward +inf, signed)
@@ -4144,6 +4148,42 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         return 1;
     }
 
+    // FCVTZS/FCVTZU (vector, fixed-point). immh:immb encodes the
+    // fractional-bit count: 64-imm for S lanes and 128-imm for D lanes.
+    if ((insn & 0xbf80fc00) == 0x0f00fc00 ||
+        (insn & 0xbf80fc00) == 0x2f00fc00) {
+        uint32_t immh = (insn >> 19) & 0xf;
+        uint32_t immb = (insn >> 16) & 0x7;
+        uint32_t imm = (immh << 3) | immb;
+        uint32_t Q = (insn >> 30) & 1;
+        uint32_t is_unsigned = (insn >> 29) & 1;
+        uint32_t rn = (insn >> 5) & 0x1f;
+        uint32_t rd = insn & 0x1f;
+        uint32_t sz;
+        uint32_t fbits;
+
+        if (immh & 0x8) {
+            sz = 1;  // double precision
+            fbits = 128 - imm;
+            if (Q == 0) {
+                gen_interrupt(state, INT_UNDEFINED);
+                return 0;
+            }
+        } else if (immh & 0x4) {
+            sz = 0;  // single precision
+            fbits = 64 - imm;
+        } else {
+            gen_interrupt(state, INT_UNDEFINED);
+            return 0;
+        }
+
+        gen(state, (unsigned long) (is_unsigned ? gadget_fcvtzu_fixpt_vec
+                                                : gadget_fcvtzs_fixpt_vec));
+        // Pack: rd | rn<<8 | sz<<16 | fbits<<17 | Q<<24
+        gen(state, rd | (rn << 8) | (sz << 16) | (fbits << 17) | (Q << 24));
+        return 1;
+    }
+
     // SHL (vector, immediate) - shift left immediate
     // 0 Q U 0 1 1 1 1 0 immh immb 0 1 0 1 0 1 Rn Rd  (U=0 for SHL)
     // immh:immb encodes the shift and element size
@@ -4752,6 +4792,39 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         return 1;
     }
 
+    // SMOV (to general) - extract and sign-extend a vector element to Wd/Xd.
+    // Q=0 selects Wd and permits B/H elements; Q=1 selects Xd and permits
+    // B/H/S elements. imm5 identifies both the element size and index.
+    if ((insn & 0xbfe0fc00) == 0x0e002c00) {
+        uint32_t imm5 = (insn >> 16) & 0x1f;
+        uint32_t rn = (insn >> 5) & 0x1f;
+        uint32_t rd = insn & 0x1f;
+        uint32_t dest64 = (insn >> 30) & 1;
+
+        int elem_size = -1;
+        if (imm5 & 0x1) elem_size = 0;       // B
+        else if (imm5 & 0x2) elem_size = 1;  // H
+        else if (imm5 & 0x4) elem_size = 2;  // S
+
+        if (elem_size < 0 || (!dest64 && elem_size == 2)) {
+            gen_interrupt(state, INT_UNDEFINED);
+            return 0;
+        }
+
+        uint32_t index = imm5 >> (elem_size + 1);
+        uint32_t max_elems = 16u >> elem_size;
+        if (index >= max_elems) {
+            gen_interrupt(state, INT_UNDEFINED);
+            return 0;
+        }
+
+        gen(state, (unsigned long) gadget_umov_vec_to_gpr);
+        // Pack: rd | rn<<8 | elem_size<<16 | index<<20 | signed<<24 | dest64<<25
+        gen(state, rd | (rn << 8) | (elem_size << 16) | (index << 20) |
+                (1u << 24) | (dest64 << 25));
+        return 1;
+    }
+
     // UMOV/MOV (to general) - extract vector element to GPR
     // Matches: 0Q001110 0imm5 0 01111 Rn Rd (UMOV/MOV scalar from vector)
     if ((insn & 0xbfe0fc00) == 0x0e003c00) {
@@ -5277,6 +5350,27 @@ static int gen_simd_fp(struct gen_state *state, uint32_t insn) {
         return 0;
     }
 skip_three_different:
+
+    // FCVTL/FCVTL2 - widen two single-precision lanes to double precision.
+    // Q selects the lower (FCVTL) or upper (FCVTL2) half of Vn.4S.
+    if ((insn & 0xbffffc00) == 0x0e617800) {
+        uint32_t Q = (insn >> 30) & 1;
+        uint32_t rn = (insn >> 5) & 0x1f;
+        uint32_t rd = insn & 0x1f;
+        gen(state, (unsigned long) gadget_fcvtl_vec);
+        gen(state, rd | (rn << 8) | (Q << 16));
+        return 1;
+    }
+
+    // FCVTN/FCVTN2 - narrow two double-precision lanes to single precision.
+    if ((insn & 0xbffffc00) == 0x0e616800) {
+        uint32_t Q = (insn >> 30) & 1;
+        uint32_t rn = (insn >> 5) & 0x1f;
+        uint32_t rd = insn & 0x1f;
+        gen(state, (unsigned long) gadget_fcvtn_vec);
+        gen(state, rd | (rn << 8) | (Q << 16));
+        return 1;
+    }
 
     // XTN/XTN2 - narrow (vector)
     // Matches: 0Q0011100ss10000 101000 Rn Rd (XTN/XTN2)

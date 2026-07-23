@@ -4338,8 +4338,10 @@ msub_store:
 1:  gret
 
 /*
- * UMOV/MOV - Move vector element to GPR (zero-extend)
- * Code stream: [gadget addr][rd | rn<<8 | elem_size<<16 | index<<20]
+ * UMOV/SMOV/MOV - Move vector element to GPR
+ * Code stream: [gadget addr]
+ *              [rd | rn<<8 | elem_size<<16 | index<<20 |
+ *               signed<<24 | dest64<<25]
  *
  * elem_size: 0=B, 1=H, 2=S, 3=D
  * index: element index within 128-bit vector
@@ -4352,6 +4354,8 @@ msub_store:
     ubfx x10, x8, #8, #5    // rn
     ubfx x11, x8, #16, #2   // elem_size
     ubfx x12, x8, #20, #4   // index
+    ubfx x4, x8, #24, #1    // signed extraction (SMOV)
+    ubfx x5, x8, #25, #1    // 64-bit destination (SMOV Xd)
 
     // Load vector register
     add x13, _cpu, #CPU_fp
@@ -4420,6 +4424,28 @@ msub_store:
     mov x3, x15
 
 .Lumov_store:
+    cbz x4, .Lumov_write
+    cmp x11, #0
+    b.eq .Lumov_sign_b
+    cmp x11, #1
+    b.eq .Lumov_sign_h
+    // SMOV only permits S elements with a 64-bit destination.
+    sxtw x3, w3
+    b .Lumov_write
+.Lumov_sign_b:
+    cbz x5, .Lumov_sign_b_w
+    sxtb x3, w3
+    b .Lumov_write
+.Lumov_sign_b_w:
+    sxtb w3, w3
+    b .Lumov_write
+.Lumov_sign_h:
+    cbz x5, .Lumov_sign_h_w
+    sxth x3, w3
+    b .Lumov_write
+.Lumov_sign_h_w:
+    sxth w3, w3
+.Lumov_write:
     add x14, _cpu, #CPU_x0
     cmp x9, #31
     b.eq .Lumov_done
@@ -5973,6 +5999,100 @@ make_fp_vec_two_reg_misc frintm_vec, frintm
 make_fp_vec_two_reg_misc frintx_vec, frintx
 make_fp_vec_two_reg_misc frintz_vec, frintz
 make_fp_vec_two_reg_misc frinti_vec, frinti
+
+/*
+ * Vector fixed-point FP-to-integer conversions. Scaling by an exact power of
+ * two is equivalent to the architectural #fbits form and allows a runtime
+ * fbits value without a large immediate-dispatch table.
+ * Code stream: [gadget addr][rd | rn<<8 | sz<<16 | fbits<<17 | Q<<24]
+ */
+.macro make_fcvt_fixpt_vec name, insn
+.gadget \name\()_fixpt_vec
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f       // rd
+    ubfx x10, x8, #8, #5    // rn
+    ubfx x11, x8, #16, #1   // sz (0=single, 1=double)
+    ubfx x12, x8, #17, #7   // fbits
+    ubfx x17, x8, #24, #1   // Q
+
+    add x13, _cpu, #CPU_fp
+    add x14, x13, x9, lsl #4
+    add x15, x13, x10, lsl #4
+    ldr q0, [x15]
+
+    cbnz x11, .L\name\()_fixpt_double
+    add x13, x12, #127
+    lsl x13, x13, #23
+    fmov s1, w13
+    dup v1.4s, v1.s[0]
+    fmul v0.4s, v0.4s, v1.4s
+    \insn v0.4s, v0.4s
+    cbz x17, .L\name\()_fixpt_2s
+    str q0, [x14]
+    gret
+.L\name\()_fixpt_2s:
+    str d0, [x14]
+    str xzr, [x14, #8]
+    gret
+
+.L\name\()_fixpt_double:
+    add x13, x12, #1023
+    lsl x13, x13, #52
+    fmov d1, x13
+    dup v1.2d, v1.d[0]
+    fmul v0.2d, v0.2d, v1.2d
+    \insn v0.2d, v0.2d
+    str q0, [x14]
+    gret
+.endm
+
+make_fcvt_fixpt_vec fcvtzs, fcvtzs
+make_fcvt_fixpt_vec fcvtzu, fcvtzu
+
+/* FCVTL/FCVTL2: widen the lower/upper two single lanes to two doubles. */
+.gadget fcvtl_vec
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f       // rd
+    ubfx x10, x8, #8, #5    // rn
+    ubfx x11, x8, #16, #1   // upper half (FCVTL2)
+
+    add x13, _cpu, #CPU_fp
+    add x14, x13, x9, lsl #4
+    add x15, x13, x10, lsl #4
+    ldr q0, [x15]
+    cbnz x11, .Lfcvtl_upper
+    fcvtl v1.2d, v0.2s
+    str q1, [x14]
+    gret
+.Lfcvtl_upper:
+    fcvtl2 v1.2d, v0.4s
+    str q1, [x14]
+    gret
+
+/* FCVTN/FCVTN2: narrow two doubles into the lower/upper single lanes. */
+.gadget fcvtn_vec
+    ldr x8, [_pc]
+    add _pc, _pc, #8
+    and x9, x8, #0x1f       // rd
+    ubfx x10, x8, #8, #5    // rn
+    ubfx x11, x8, #16, #1   // upper half (FCVTN2)
+
+    add x13, _cpu, #CPU_fp
+    add x14, x13, x9, lsl #4
+    add x15, x13, x10, lsl #4
+    ldr q0, [x15]
+    cbnz x11, .Lfcvtn_upper
+    fcvtn v1.2s, v0.2d
+    str d1, [x14]
+    str xzr, [x14, #8]
+    gret
+.Lfcvtn_upper:
+    ldr q1, [x14]
+    fcvtn2 v1.4s, v0.2d
+    str q1, [x14]
+    gret
 
 /*
  * Vector FP compare-with-zero instructions

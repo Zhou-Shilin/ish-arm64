@@ -71,14 +71,24 @@ struct msghdr64_ {
 #endif
 
 struct cmsghdr_ {
+#ifdef GUEST_ARM64
+    uint64_t len;
+#else
     dword_t len;
+#endif
     int_t level;
     int_t type;
     uint8_t data[];
 };
 #define SCM_RIGHTS_ 1
+#define SCM_CREDENTIALS_ 2
 // copied and ported from musl
-#define CMSG_LEN_(cmsg) (((cmsg)->len + sizeof(dword_t) - 1) & ~(dword_t)(sizeof(dword_t) - 1))
+#ifdef GUEST_ARM64
+#define CMSG_ALIGN_ 8
+#else
+#define CMSG_ALIGN_ sizeof(dword_t)
+#endif
+#define CMSG_LEN_(cmsg) (((cmsg)->len + CMSG_ALIGN_ - 1) & ~(uint64_t)(CMSG_ALIGN_ - 1))
 #define CMSG_NEXT_(cmsg) ((uint8_t *)(cmsg) + CMSG_LEN_(cmsg))
 #define CMSG_NXTHDR_(cmsg, mhdr_end) ((cmsg)->len < sizeof (struct cmsghdr_) || \
         CMSG_LEN_(cmsg) + sizeof(struct cmsghdr_) >= (size_t) (mhdr_end - (uint8_t *)(cmsg)) \
@@ -86,6 +96,7 @@ struct cmsghdr_ {
 
 struct scm {
     struct list queue;
+    struct ucred_ cred;
     unsigned num_fds;
     struct fd *fds[];
 };
@@ -205,6 +216,7 @@ static inline int sock_flags_from_real(int real) {
 #define SO_KEEPALIVE_ 9
 #define SO_LINGER_ 13
 #define SO_REUSEPORT_ 15
+#define SO_PASSCRED_ 16
 #define SO_PEERCRED_ 17
 #define SO_TIMESTAMP_ 29
 #define SO_PROTOCOL_ 38
@@ -245,6 +257,7 @@ static inline int sock_opt_to_real(int fake, int level) {
             case SO_RCVTIMEO_: return SO_RCVTIMEO;
             case SO_SNDTIMEO_: return SO_SNDTIMEO;
             case SO_REUSEPORT_: return SO_REUSEPORT;
+            case SO_PASSCRED_: return 0; // emulated by the guest Unix socket layer
         } break;
         case IPPROTO_TCP: switch (fake) {
             case TCP_NODELAY_: return TCP_NODELAY;

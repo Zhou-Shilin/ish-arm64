@@ -59,9 +59,16 @@ term.reset();
 
 let oldProps = {};
 function syncProp(name, value) {
-    if (oldProps[name] !== value)
+    if (oldProps[name] !== value) {
+        oldProps[name] = value;
         native.propUpdate(name, value);
+    }
 }
+const originalSetWindowTitle = term.setWindowTitle.bind(term);
+term.setWindowTitle = (title) => {
+    originalSetWindowTitle(title);
+    syncProp('title', title);
+};
 let decoder = new TextDecoder();
 exports.write = (data) => {
     term.io.writeUTF16(decoder.decode(lib.codec.stringToCodeUnitArray(data)));
@@ -69,6 +76,41 @@ exports.write = (data) => {
 };
 term.io.sendString = term.io.onVTKeyStroke = (data) => {
     native.sendInput(data);
+};
+exports.sendKey = (key, control, alt) => {
+    const modifier = control && alt ? 7 : control ? 5 : alt ? 3 : 0;
+    const modifiedCsi = (prefix, suffix) =>
+        modifier == 0 ? `\x1b[${prefix}${suffix}` : `\x1b[${prefix};${modifier}${suffix}`;
+    let data = '';
+    switch (key) {
+        case 'Escape': data = '\x1b'; break;
+        case 'Tab': data = '\t'; break;
+        case 'Backspace':
+            data = `${alt ? '\x1b' : ''}${control ? '\x08' : '\x7f'}`;
+            break;
+        case 'Enter': data = `${alt ? '\x1b' : ''}\r`; break;
+        case 'Insert': data = modifiedCsi('2', '~'); break;
+        case 'Delete': data = modifiedCsi('3', '~'); break;
+        case 'PageUp': data = modifiedCsi('5', '~'); break;
+        case 'PageDown': data = modifiedCsi('6', '~'); break;
+        case 'Home':
+            data = modifier == 0 ? (term.keyboard.applicationCursor ? '\x1bOH' : '\x1b[H') : modifiedCsi('1', 'H');
+            break;
+        case 'End':
+            data = modifier == 0 ? (term.keyboard.applicationCursor ? '\x1bOF' : '\x1b[F') : modifiedCsi('1', 'F');
+            break;
+        case 'Up':
+        case 'Down':
+        case 'Right':
+        case 'Left': {
+            const suffix = {Up: 'A', Down: 'B', Right: 'C', Left: 'D'}[key];
+            data = modifier == 0
+                ? `\x1b${term.keyboard.applicationCursor ? 'O' : '['}${suffix}`
+                : modifiedCsi('1', suffix);
+            break;
+        }
+    }
+    if (data) term.io.sendString(data);
 };
 
 // hterm size updates native size

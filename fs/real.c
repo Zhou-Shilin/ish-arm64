@@ -108,11 +108,16 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
 }
 
 int realfs_close(struct fd *fd) {
+    char changed_path[MAX_PATH];
+    bool record_write = (fd->flags & (O_WRONLY_ | O_RDWR_ | O_TRUNC_ | O_APPEND_)) &&
+        realfs_getpath(fd, changed_path) == 0;
     if (fd->dir != NULL)
         closedir(fd->dir);
     int err = close(fd->real_fd);
     if (err < 0)
         return errno_map();
+    if (record_write)
+        fakefs_record_change(changed_path, FAKEFS_CHANGE_OP_WRITE);
     return 0;
 }
 
@@ -574,6 +579,7 @@ int realfs_utime(struct mount *mount, const char *path, struct timespec atime, s
     int err = utimensat(mount->root_fd, fix_path(path), times, 0);
     if (err < 0)
         return errno_map();
+    fakefs_record_change(path, FAKEFS_CHANGE_OP_METADATA);
     return 0;
 }
 
@@ -590,7 +596,9 @@ int realfs_flock(struct fd *fd, int operation) {
     if (operation & LOCK_EX_) real_op |= LOCK_EX;
     if (operation & LOCK_UN_) real_op |= LOCK_UN;
     if (operation & LOCK_NB_) real_op |= LOCK_NB;
-    return flock(fd->real_fd, real_op);
+    if (flock(fd->real_fd, real_op) < 0)
+        return errno_map();
+    return 0;
 }
 
 int realfs_statfs(struct mount *mount, struct statfsbuf *stat) {

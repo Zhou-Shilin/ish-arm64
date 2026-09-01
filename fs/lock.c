@@ -214,15 +214,7 @@ out:
     return err;
 }
 
-int fcntl_setlk(struct fd *fd, struct flock_ *flock, bool blocking) {
-    if (flock->type != F_RDLCK_ && flock->type != F_WRLCK_ && flock->type != F_UNLCK_)
-        return _EINVAL;
-    int fd_mode = fd_getflags(fd) & O_ACCMODE_;
-    if (flock->type == F_RDLCK_ && fd_mode == O_WRONLY_)
-        return _EBADF;
-    if (flock->type == F_WRLCK_ && fd_mode == O_RDONLY_)
-        return _EBADF;
-
+static int file_lock_setlk(struct fd *fd, struct flock_ *flock, bool blocking) {
     struct inode_data *inode = fd->inode;
     lock(&inode->lock);
 
@@ -240,6 +232,30 @@ int fcntl_setlk(struct fd *fd, struct flock_ *flock, bool blocking) {
 out:
     unlock(&inode->lock);
     return err;
+}
+
+int fcntl_setlk(struct fd *fd, struct flock_ *flock, bool blocking) {
+    if (flock->type != F_RDLCK_ && flock->type != F_WRLCK_ && flock->type != F_UNLCK_)
+        return _EINVAL;
+    int fd_mode = fd_getflags(fd) & O_ACCMODE_;
+    if (flock->type == F_RDLCK_ && fd_mode == O_WRONLY_)
+        return _EBADF;
+    if (flock->type == F_WRLCK_ && fd_mode == O_RDONLY_)
+        return _EBADF;
+    return file_lock_setlk(fd, flock, blocking);
+}
+
+int flock_setlk(struct fd *fd, int type, bool blocking) {
+    if (type != F_RDLCK_ && type != F_WRLCK_ && type != F_UNLCK_)
+        return _EINVAL;
+    struct flock_ flock = {
+        .type = type,
+        .whence = LSEEK_SET,
+        .start = 0,
+        .len = 0,
+        .pid = current->pid,
+    };
+    return file_lock_setlk(fd, &flock, blocking);
 }
 
 void file_lock_remove_owned_by(struct fd *fd, void *owner) {

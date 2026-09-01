@@ -92,19 +92,26 @@ static int epoll_callback(void *context, int types, union poll_fd_info info) {
 
 int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t timeout) {
     STRACE("epoll_wait(%d, %#x, %d, %d)", epoll_f, events_addr, max_events, timeout);
-    struct fd *epoll = f_get(epoll_f);
+    // epoll_wait can block while another thread closes the same guest fd.
+    // Keep the open file description (and its poll object) alive until this
+    // syscall returns instead of leaving poll_wait with a freed poll pointer.
+    struct fd *epoll = f_get_retain(epoll_f);
     if (epoll == NULL)
         return _EBADF;
-    if (epoll->ops != &epoll_ops)
+    if (epoll->ops != &epoll_ops) {
+        fd_close(epoll);
         return _EINVAL;
+    }
 
     struct timespec timeout_ts;
     if (timeout >= 0) {
         timeout_ts.tv_sec = timeout / 1000;
         timeout_ts.tv_nsec = (timeout % 1000) * 1000000;
     }
-    if (max_events <= 0)
+    if (max_events <= 0) {
+        fd_close(epoll);
         return _EINVAL;
+    }
     struct epoll_event_ events[max_events];
 
     struct epoll_context context = {.events = events, .n = 0, .max_events = max_events};
@@ -128,7 +135,7 @@ int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t t
             STRACE(" {events: %#x, data: %#x}", events[i].events, events[i].data);
         }
         if (user_write(events_addr, events, sizeof(struct epoll_event_) * res))
-            return _EFAULT;
+            res = _EFAULT;
     } else if (res != _EINTR) {
         // Host-level errors from kqueue/kevent should not propagate to the guest
         // as unexpected errnos. libuv asserts that epoll_pwait only fails with
@@ -137,6 +144,7 @@ int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t t
         printk("epoll_wait: converting error %d to EINTR (pid=%d)\n", res, current->pid);
         res = _EINTR;
     }
+    fd_close(epoll);
     return res;
 }
 

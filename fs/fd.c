@@ -156,6 +156,15 @@ struct fd *f_get(fd_t f) {
     return fd;
 }
 
+struct fd *f_get_retain(fd_t f) {
+    lock(&current->files->lock);
+    struct fd *fd = fdtable_get(current->files, f);
+    if (fd != NULL)
+        fd_retain(fd);
+    unlock(&current->files->lock);
+    return fd;
+}
+
 static fd_t f_install_start(struct fd *fd, fd_t start) {
     assert(start >= 0);
     struct fdtable *table = current->files;

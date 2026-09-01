@@ -155,15 +155,12 @@ static addr_t do_mmap(addr_t addr, uint64_t len, dword_t prot, dword_t flags, fd
                 return err;
             return page << PAGE_BITS;
         }
-        // Large PROT_NONE reservations (V8 heap cage chunks) use lazy
-        // mapping even without MAP_NORESERVE. V8 reserves 128MB
-        // chunks with PROT_NONE then mprotect's sub-regions RW as it
-        // allocates. Allocating all 128MB of host memory up front
-        // would waste ~640MB per node process; track the region as a
-        // mem_reservation instead and demand-map each page on first
-        // mprotect/touch. The INT_GPF write-fault demand-map path
-        // uses mem_find_reservation to detect cage pages.
-        if (is_prot_none && pages >= 0x8000) {
+        // Large guest PROT_NONE reservations do not need matching host VM.
+        // Node/V8 and Go reserve many 16-64MB regions; mirroring those with
+        // host mmap exhausts iOS's app VM limit even though almost none of the
+        // pages are committed. Keep only guest metadata and materialize the
+        // portions later changed to readable/writable by mprotect.
+        if (is_prot_none && pages >= 0x1000) {
             if ((err = pt_map_lazy(current->mem, page, pages, prot)) < 0)
                 return err;
             return page << PAGE_BITS;

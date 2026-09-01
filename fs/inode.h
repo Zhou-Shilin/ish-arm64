@@ -71,6 +71,7 @@ struct flock32_ {
 int fcntl_getlk(struct fd *fd, struct flock_ *flock);
 // cmd should be either F_SETLK or F_SETLKW
 int fcntl_setlk(struct fd *fd, struct flock_ *flock, bool block);
+int flock_setlk(struct fd *fd, int type, bool block);
 
 // locks the inode internally
 void file_lock_remove_owned_by(struct fd *fd, void *owner);

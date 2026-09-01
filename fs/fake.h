@@ -54,6 +54,7 @@ bool fakefs_bind_mount_translate_path(const char *path, char *out_path, size_t o
 #define FAKEFS_CHANGE_OP_UNLINK    1
 #define FAKEFS_CHANGE_OP_RENAME    2  /* destination of rename */
 #define FAKEFS_CHANGE_OP_TRUNCATE  3
+#define FAKEFS_CHANGE_OP_METADATA  4
 
 struct fakefs_change_event {
     char     linux_path[1024];

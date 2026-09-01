@@ -19,6 +19,7 @@
 #include "util/signpost.h"
 
 #include "debug.h"
+#include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
@@ -520,6 +521,7 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
     }
     path_link(fs, src, dst);
     db_commit(fs);
+    fakefs_record_change(dst, FAKEFS_CHANGE_OP_WRITE);
     return 0;
 }
 
@@ -677,6 +679,7 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
     ishstat.rdev = 0;
     path_create(fs, link, &ishstat);
     db_commit(fs);
+    fakefs_record_change(link, FAKEFS_CHANGE_OP_WRITE);
     return 0;
 }
 
@@ -704,6 +707,7 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
     if (path_get_inode(fs, path) == 0)
         path_create(fs, path, &stat);
     db_commit(fs);
+    fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
     return 0;
 }
 
@@ -865,10 +869,12 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
             case attr_size:
                 if (truncate(host_abs_chk, attr.size) < 0)
                     return errno_map();
+                fakefs_record_change(path, FAKEFS_CHANGE_OP_TRUNCATE);
                 return 0;
             case attr_mode:
                 if (chmod(host_abs_chk, attr.mode) < 0)
                     return errno_map();
+                fakefs_record_change(path, FAKEFS_CHANGE_OP_METADATA);
                 return 0;
             case attr_uid:
             case attr_gid:
@@ -896,6 +902,7 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
                 fake_stat_setattr(&ishstat, attr);
                 inode_write_stat(fs, inode, &ishstat);
                 db_commit(fs);
+                fakefs_record_change(path, FAKEFS_CHANGE_OP_METADATA);
                 return 0;
             }
         }
@@ -904,6 +911,7 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
     fake_stat_setattr(&ishstat, attr);
     inode_write_stat(fs, inode, &ishstat);
     db_commit(fs);
+    fakefs_record_change(path, FAKEFS_CHANGE_OP_METADATA);
     return 0;
 }
 
@@ -935,6 +943,9 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
     fake_stat_setattr(&ishstat, attr);
     inode_write_stat(fs, fd->fake_inode, &ishstat);
     db_commit(fs);
+    char changed_path[MAX_PATH];
+    if (realfs_getpath(fd, changed_path) == 0)
+        fakefs_record_change(changed_path, FAKEFS_CHANGE_OP_METADATA);
     return 0;
 }
 
@@ -973,6 +984,7 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     ishstat.rdev = 0;
     path_create(fs, path, &ishstat);
     db_commit(fs);
+    fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
     if (via_bind)
         fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
     return 0;
@@ -1385,6 +1397,22 @@ static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
     db_commit(fs);
 }
 
+// Keep Alpine package database locking inside the guest. Forwarding flock to
+// the iOS host can fail for app-container files even though fakefs itself is
+// writable, which makes apk surface the host failure as EPERM.
+static int fakefs_flock(struct fd *fd, int operation) {
+    int type;
+    if (operation & LOCK_UN_)
+        type = F_UNLCK_;
+    else if (operation & LOCK_EX_)
+        type = F_WRLCK_;
+    else if (operation & LOCK_SH_)
+        type = F_RDLCK_;
+    else
+        return _EINVAL;
+    return flock_setlk(fd, type, (operation & LOCK_NB_) == 0);
+}
+
 const struct fs_ops fakefs = {
     .name = "fake", .magic = 0x66616b65,
     .mount = fakefs_mount,
@@ -1401,7 +1429,7 @@ const struct fs_ops fakefs = {
     .close = realfs_close,
     .stat = fakefs_stat,
     .fstat = fakefs_fstat,
-    .flock = realfs_flock,
+    .flock = fakefs_flock,
     .setattr = fakefs_setattr,
     .fsetattr = fakefs_fsetattr,
     .getpath = realfs_getpath,
